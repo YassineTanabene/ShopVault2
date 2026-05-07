@@ -4,7 +4,7 @@ name: Deploy — Full Pipeline
 on:
   push:
     branches: [main]
-
+workflow_dispatch:
 permissions:
   contents: read
 
