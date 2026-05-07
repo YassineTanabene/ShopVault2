@@ -19,6 +19,7 @@ out/
 
 # Terraform
 *.tfvars
+!infrastructure/environments/dev.tfvars
 !*.tfvars.example
 .terraform/
 *.tfstate

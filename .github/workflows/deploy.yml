@@ -1,13 +1,11 @@
 name: Deploy — Full Pipeline
 
-# Declenche sur push vers main (exigence prof)
 on:
   push:
     branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
-
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   # Variables Terraform injectees depuis GitHub Secrets
