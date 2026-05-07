@@ -4,6 +4,16 @@
 # Exigence prof : nginx reverse-proxy port 80 -> 3000 + docker pull image frontend
 # Le frontend communique UNIQUEMENT avec le DNS de l'ALB backend
 # JAMAIS via l'IP directe d'une instance EC2 backend
+#
+# ARCHITECTURE DES APPELS API :
+#   Browser → GET/POST /api/* (URL relative)
+#     → nginx port 80
+#       → /api/* : proxy_pass vers ALB backend (http://${alb_dns_name})
+#       → /*     : proxy_pass vers Next.js (localhost:3000)
+#
+# NOTE : NEXT_PUBLIC_API_URL est vide au build (baked dans le bundle JS).
+# Le client Next.js fait des appels relatifs /api/... intentionnellement.
+# Nginx joue le role de "API gateway" pour le frontend.
 # =============================================================================
 
 set -e
@@ -48,32 +58,69 @@ docker pull ${frontend_image}
 echo "[OK] Image frontend pullee : ${frontend_image}"
 
 # -----------------------------------------------------------------------------
-# 4. Configuration nginx — reverse proxy port 80 -> localhost:3000
-# Exigence prof : le frontend Next.js tourne sur port 3000
-# nginx ecoute sur port 80 et forward vers 3000
+# 4. Configuration nginx — double responsabilite :
+#    a) /api/* et /health → proxy vers l'ALB backend (port 80)
+#    b) /*               → proxy vers Next.js (localhost:3000)
+#
+# POURQUOI : NEXT_PUBLIC_API_URL est vide au build (baked dans le JS bundle).
+# Le browser fait des appels relatifs (/api/auth/register).
+# Nginx intercepte /api/* et les forward vers l'ALB backend.
+# C'est la seule correction sans modifier le code frontend.
 # -----------------------------------------------------------------------------
-cat > /etc/nginx/sites-available/frontend << 'NGINX_CONF'
+ALB_URL="http://${alb_dns_name}"
+
+cat > /etc/nginx/sites-available/frontend << NGINX_CONF
 server {
     listen 80;
     server_name _;
 
-    # Health check nginx
+    # ------------------------------------------------------------------
+    # Health check nginx (pour debug)
+    # ------------------------------------------------------------------
     location /nginx-health {
         return 200 "nginx ok\n";
         add_header Content-Type text/plain;
     }
 
-    # Proxy vers le conteneur Next.js (port 3000)
+    # ------------------------------------------------------------------
+    # CRITIQUE : proxy /api/* vers l'ALB backend
+    # Le browser Next.js fait des appels relatifs /api/...
+    # Nginx les intercepte et les forward vers le backend via l'ALB
+    # ------------------------------------------------------------------
+    location /api/ {
+        proxy_pass         $ALB_URL/api/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 10s;
+    }
+
+    # ------------------------------------------------------------------
+    # Health check backend (accessible depuis internet pour debug)
+    # ------------------------------------------------------------------
+    location = /health {
+        proxy_pass         $ALB_URL/health;
+        proxy_http_version 1.1;
+        proxy_set_header   Host \$host;
+        proxy_read_timeout 10s;
+    }
+
+    # ------------------------------------------------------------------
+    # Tout le reste -> Next.js (localhost:3000)
+    # ------------------------------------------------------------------
     location / {
         proxy_pass         http://localhost:3000;
         proxy_http_version 1.1;
-        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Upgrade \$http_upgrade;
         proxy_set_header   Connection 'upgrade';
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
         proxy_read_timeout 300s;
         proxy_connect_timeout 75s;
     }
@@ -89,16 +136,15 @@ nginx -t
 systemctl restart nginx
 systemctl enable nginx
 
-echo "[OK] nginx configure et demarre (port 80 -> 3000)"
+echo "[OK] nginx configure : /api/* -> ALB ($ALB_URL), /* -> Next.js :3000"
 
 # -----------------------------------------------------------------------------
 # 5. Demarrage du conteneur frontend
-# NEXT_PUBLIC_API_URL = DNS de l'ALB backend (exigence prof : jamais IP directe)
-# INTERNAL_API_URL = pour le SSR (server-side rendering) Next.js
+# INTERNAL_API_URL : utilise par Next.js cote serveur (SSR) pour les appels API
+# NEXT_PUBLIC_API_URL : vide intentionnellement (le browser fait des appels
+#                       relatifs /api/* interceptes par nginx -> ALB)
 # --restart always : redemarrage automatique si crash ou reboot EC2
 # -----------------------------------------------------------------------------
-ALB_URL="http://${alb_dns_name}"
-
 docker run -d \
   --name frontend \
   --restart always \
@@ -106,13 +152,13 @@ docker run -d \
   -e NODE_ENV=production \
   -e PORT=3000 \
   -e HOSTNAME="0.0.0.0" \
-  -e NEXT_PUBLIC_API_URL="$ALB_URL" \
   -e INTERNAL_API_URL="$ALB_URL" \
   -e NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY="${next_public_stripe_publishable_key}" \
   ${frontend_image}
 
 echo "[OK] Conteneur frontend demarre sur port 3000"
-echo "[OK] NEXT_PUBLIC_API_URL = $ALB_URL"
+echo "[OK] INTERNAL_API_URL (SSR) = $ALB_URL"
+echo "[OK] Appels client /api/* interceptes par nginx et proxyifies vers $ALB_URL"
 
 # -----------------------------------------------------------------------------
 # 6. Health check loop — attendre que le frontend soit pret
@@ -127,16 +173,17 @@ for i in $(seq 1 30); do
   sleep 10
 done
 
-# Verifier que nginx proxy fonctionne
-echo "[INFO] Verification du proxy nginx..."
-if curl -sf http://localhost:80 > /dev/null 2>&1; then
-  echo "[OK] Proxy nginx operationnel (port 80 -> 3000)"
+# Verifier que le proxy nginx /api/ fonctionne
+echo "[INFO] Verification du proxy nginx /api/ vers ALB..."
+if curl -sf "$ALB_URL/health" > /dev/null 2>&1; then
+  echo "[OK] ALB backend accessible depuis le frontend EC2"
 else
-  echo "[WARN] Proxy nginx pas encore operationnel, verifier les logs nginx"
+  echo "[WARN] ALB backend pas encore accessible, verifier les SGs et le health check"
 fi
 
 echo "======================================================="
 echo " ShopVault Frontend — User Data Complete"
 echo " $(date)"
-echo " Frontend disponible sur : http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+echo " Frontend : http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+echo " API proxy : /* -> :3000, /api/* -> $ALB_URL"
 echo "======================================================="
