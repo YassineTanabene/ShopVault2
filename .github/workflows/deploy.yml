@@ -8,7 +8,6 @@ permissions:
   contents: read
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  # Variables Terraform injectees depuis GitHub Secrets
   TF_VAR_environment: dev
   TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
   TF_VAR_app_name: ecommerce
@@ -29,13 +28,11 @@ env:
 
 jobs:
   # ===========================================================================
-  # Job 1 — Build & Push Docker images vers Docker Hub
-  # Exigence prof : images backend et frontend buildees et poussees
+  # Job 1 — Build & Push Docker images
   # ===========================================================================
   build-push:
     name: Build & Push Docker Images
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,7 +43,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ── Image Backend ─────────────────────────────────────────────────────
       - name: Build and push backend image
         working-directory: backend
         run: |
@@ -55,10 +51,7 @@ jobs:
             -t ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-backend:${{ github.sha }} .
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-backend:latest
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-backend:${{ github.sha }}
-          echo "Backend image pushed: shopvault-backend:${{ github.sha }}"
 
-      # ── Image Frontend ────────────────────────────────────────────────────
-      # NEXT_PUBLIC_API_URL vide au build — injecte au runtime via User Data EC2
       - name: Build and push frontend image
         working-directory: frontend
         run: |
@@ -69,53 +62,46 @@ jobs:
             -t ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-frontend:${{ github.sha }} .
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-frontend:latest
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/shopvault-frontend:${{ github.sha }}
-          echo "Frontend image pushed: shopvault-frontend:${{ github.sha }}"
 
   # ===========================================================================
-  # Job 2 — Terraform : provisioning de l'infrastructure AWS
-  # Exigence prof : terraform init, validate, plan, apply
+  # Job 2 — Terraform : provisioning AWS infrastructure
   # ===========================================================================
   terraform:
     name: Terraform Apply
     runs-on: ubuntu-latest
     needs: build-push
     outputs:
-      alb_dns: ${{ steps.tf-output.outputs.alb_dns }}
-      frontend_ip: ${{ steps.tf-output.outputs.frontend_ip }}
+      alb_dns:      ${{ steps.tf-output.outputs.alb_dns }}
+      frontend_ip:  ${{ steps.tf-output.outputs.frontend_ip }}
       frontend_dns: ${{ steps.tf-output.outputs.frontend_dns }}
+      asg_name:     ${{ steps.tf-output.outputs.asg_name }}
+      rds_host:     ${{ steps.tf-output.outputs.rds_host }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Credentials AWS Academy ───────────────────────────────────────────
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
-      # ── Bucket S3 pour le state Terraform ────────────────────────────────
       - name: Create Terraform state bucket (if not exists)
         run: |
           BUCKET="ecommerce-terraform-state-${{ secrets.AWS_ACCOUNT_ID }}"
           if ! aws s3 ls "s3://$BUCKET" 2>/dev/null; then
             aws s3 mb "s3://$BUCKET" --region ${{ secrets.AWS_REGION }}
-            echo "State bucket created: $BUCKET"
-          else
-            echo "State bucket already exists: $BUCKET"
           fi
 
-      # ── Setup Terraform ───────────────────────────────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: '1.7.0'
           terraform_wrapper: false
 
-      # ── Terraform Init ────────────────────────────────────────────────────
       - name: Terraform Init
         working-directory: infrastructure
         run: |
@@ -126,56 +112,186 @@ jobs:
             -backend-config="key=state/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION }}"
 
-      # ── Terraform Validate ────────────────────────────────────────────────
       - name: Terraform Validate
         working-directory: infrastructure
         run: terraform validate
 
-      # ── Terraform Plan ────────────────────────────────────────────────────
-      # Exigence prof : utiliser -var-file=environments/dev.tfvars
       - name: Terraform Plan
         working-directory: infrastructure
-        run: |
-          terraform plan \
-            -var-file=environments/dev.tfvars \
-            -out=tfplan
+        run: terraform plan -var-file=environments/dev.tfvars -out=tfplan
 
-      # ── Terraform Apply ───────────────────────────────────────────────────
       - name: Terraform Apply
         working-directory: infrastructure
         run: terraform apply -auto-approve tfplan
 
-      # ── Affichage des Outputs ─────────────────────────────────────────────
-      # Exigence prof : afficher ALB DNS et IP Frontend dans les logs
       - name: Get Terraform Outputs
         id: tf-output
         working-directory: infrastructure
         run: |
-          ALB_DNS=$(terraform output -raw alb_dns_name 2>/dev/null || echo "")
-          FRONTEND_IP=$(terraform output -raw frontend_public_ip 2>/dev/null || echo "")
+          ALB_DNS=$(terraform output -raw alb_dns_name       2>/dev/null || echo "")
+          FRONTEND_IP=$(terraform output -raw frontend_public_ip  2>/dev/null || echo "")
           FRONTEND_DNS=$(terraform output -raw frontend_public_dns 2>/dev/null || echo "")
-          ASG_NAME=$(terraform output -raw backend_asg_name 2>/dev/null || echo "")
+          ASG_NAME=$(terraform output -raw backend_asg_name  2>/dev/null || echo "")
+          # RDS endpoint format: host:5432 — extract host only, mask in logs
+          RDS_ENDPOINT=$(terraform output -raw rds_endpoint  2>/dev/null || echo "")
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
+          echo "::add-mask::$RDS_HOST"
 
-          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "alb_dns=$ALB_DNS"        >> $GITHUB_OUTPUT
           echo "frontend_ip=$FRONTEND_IP" >> $GITHUB_OUTPUT
           echo "frontend_dns=$FRONTEND_DNS" >> $GITHUB_OUTPUT
+          echo "asg_name=$ASG_NAME"      >> $GITHUB_OUTPUT
+          echo "rds_host=$RDS_HOST"      >> $GITHUB_OUTPUT
 
           echo ""
           echo "=============================================="
           echo "  DEPLOYMENT COMPLETE"
           echo "=============================================="
-          echo ""
-          echo "  FRONTEND (utilisateurs)"
-          echo "  URL:       http://$FRONTEND_IP"
-          echo "  DNS:       http://$FRONTEND_DNS"
-          echo ""
-          echo "  BACKEND API (via ALB)"
-          echo "  ALB DNS:   http://$ALB_DNS"
-          echo "  Health:    http://$ALB_DNS/health"
-          echo ""
-          echo "  ASG:       $ASG_NAME"
-          echo ""
-          echo "  Admin:     admin@example.com / Password123!"
-          echo "  User:      user@example.com  / Password123!"
-          echo ""
+          echo "  FRONTEND : http://$FRONTEND_IP"
+          echo "  ALB DNS  : http://$ALB_DNS"
+          echo "  Health   : http://$ALB_DNS/health"
+          echo "  ASG      : $ASG_NAME"
+          echo "  Admin    : admin@example.com / Password123!"
+          echo "  User     : user@example.com  / Password123!"
           echo "=============================================="
+
+  # ===========================================================================
+  # Job 3 — Database Seed (une seule fois, idempotent)
+  # Strategy :
+  #   1. Attendre que le backend soit healthy via ALB
+  #   2. Check idempotent : tenter login admin — si 200, skip
+  #   3. Sinon : SSM port-forward localhost:5432 → EC2 backend → RDS
+  #   4. Exécuter seed.ts depuis le runner GitHub Actions
+  #   5. Fermer le tunnel
+  # ===========================================================================
+  seed:
+    name: Database Seed (one-time, idempotent)
+    runs-on: ubuntu-latest
+    needs: terraform
+    env:
+      ALB_DNS:  ${{ needs.terraform.outputs.alb_dns }}
+      ASG_NAME: ${{ needs.terraform.outputs.asg_name }}
+      RDS_HOST: ${{ needs.terraform.outputs.rds_host }}
+      DB_NAME:  ecommerce_dev
+      DB_USER:  ecommerceadmin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ── 1. Attendre que le backend soit healthy ──────────────────────────
+      - name: Wait for backend to be healthy (max 10 min)
+        run: |
+          echo "Waiting for ALB backend health check..."
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "[OK] Backend healthy after ${i}x10s"
+              break
+            fi
+            echo "  Attempt $i/60 — HTTP $STATUS — retrying in 10s..."
+            sleep 10
+          done
+
+      # ── 2. Vérification idempotent : login admin ─────────────────────────
+      # Si le compte admin existe déjà → base déjà seedée → on skip
+      - name: Check if database is already seeded
+        id: check-seed
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "http://$ALB_DNS/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{"email":"admin@example.com","password":"Password123!"}' \
+            --max-time 10 || echo "000")
+
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "201" ]; then
+            echo "already_seeded=true" >> $GITHUB_OUTPUT
+            echo "[SKIP] Admin login returned $STATUS — database already seeded"
+          else
+            echo "already_seeded=false" >> $GITHUB_OUTPUT
+            echo "[INFO] Admin login returned $STATUS — will run seed"
+          fi
+
+      # ── 3. Récupérer une instance backend InService ──────────────────────
+      - name: Get one InService backend EC2 instance
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        id: get-instance
+        run: |
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text | awk '{print $1}')
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "[ERROR] No InService instance found in ASG $ASG_NAME"
+            exit 1
+          fi
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "[OK] Using instance: $INSTANCE_ID"
+
+      # ── 4. Installer le plugin SSM Session Manager ───────────────────────
+      - name: Install AWS SSM Session Manager plugin
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        run: |
+          curl -sL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+            -o /tmp/smp.deb
+          sudo dpkg -i /tmp/smp.deb
+          session-manager-plugin --version
+
+      # ── 5. Ouvrir le tunnel SSM : localhost:5432 → EC2 → RDS:5432 ────────
+      - name: Start SSM port-forwarding tunnel to RDS
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        run: |
+          aws ssm start-session \
+            --target "${{ steps.get-instance.outputs.instance_id }}" \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "{\"host\":[\"$RDS_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"5432\"]}" &
+          echo "SSM_TUNNEL_PID=$!" >> $GITHUB_ENV
+          echo "[INFO] SSM tunnel starting (PID: $!), waiting 8s..."
+          sleep 8
+
+      # ── 6. Setup Node.js + dépendances ───────────────────────────────────
+      - name: Setup Node.js 20
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend dependencies (Prisma + ts-node)
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        working-directory: backend
+        run: npm ci
+
+      - name: Generate Prisma client
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        working-directory: backend
+        run: npx prisma generate --schema=src/prisma/schema.prisma
+
+      # ── 7. Exécuter le seed via le tunnel SSM ────────────────────────────
+      - name: Run database seed
+        if: steps.check-seed.outputs.already_seeded == 'false'
+        working-directory: backend
+        env:
+          # DATABASE_URL pointe vers localhost:5432 (tunnel SSM → RDS)
+          DATABASE_URL: "postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@localhost:5432/${{ env.DB_NAME }}"
+        run: |
+          echo "[INFO] Running seed via SSM tunnel..."
+          npx ts-node --project tsconfig.json ../scripts/seed.ts
+          echo "[OK] Seed completed successfully"
+
+      # ── 8. Fermer le tunnel SSM ───────────────────────────────────────────
+      - name: Stop SSM tunnel
+        if: always() && steps.check-seed.outputs.already_seeded == 'false'
+        run: |
+          if [ -n "$SSM_TUNNEL_PID" ]; then
+            kill "$SSM_TUNNEL_PID" 2>/dev/null || true
+            echo "[OK] SSM tunnel closed"
+          fi

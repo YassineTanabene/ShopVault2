@@ -21,7 +21,13 @@ apt-get install -y \
   docker.io \
   curl \
   jq \
-  awscli
+  awscli \
+  snapd
+
+# SSM Agent — requis pour le tunnel SSM depuis GitHub Actions (job seed)
+snap install amazon-ssm-agent --classic || true
+systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+systemctl start  snap.amazon-ssm-agent.amazon-ssm-agent.service || true
 
 # Demarrer et activer Docker
 systemctl start docker
