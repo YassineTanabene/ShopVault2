@@ -152,14 +152,12 @@ jobs:
           FRONTEND_IP=$(terraform output -raw frontend_public_ip  2>/dev/null || echo "")
           FRONTEND_DNS=$(terraform output -raw frontend_public_dns 2>/dev/null || echo "")
           ASG_NAME=$(terraform output -raw backend_asg_name  2>/dev/null || echo "")
-          RDS_ENDPOINT=$(terraform output -raw rds_endpoint   2>/dev/null || echo "")
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
-          echo "::add-mask::$RDS_HOST"
 
-          echo "alb_dns=$ALB_DNS"         >> $GITHUB_OUTPUT
-          echo "frontend_ip=$FRONTEND_IP" >> $GITHUB_OUTPUT
-          echo "asg_name=$ASG_NAME"       >> $GITHUB_OUTPUT
-          echo "rds_host=$RDS_HOST"       >> $GITHUB_OUTPUT
+          # Outputs — alb_dns AVANT tout masquage, rds_host non expose
+          echo "alb_dns=$ALB_DNS"          >> $GITHUB_OUTPUT
+          echo "frontend_ip=$FRONTEND_IP"  >> $GITHUB_OUTPUT
+          echo "asg_name=$ASG_NAME"        >> $GITHUB_OUTPUT
+          # rds_host non expose en output — resolu dans seed via AWS CLI
 
   # ===========================================================================
   # Job 3 — Database Seed (une seule fois, idempotent)
@@ -169,12 +167,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: terraform
     if: always() && needs.terraform.result == 'success'
+    # Pas d'env globaux issus de job outputs (risque de masquage ::add-mask::).
+    # Tous les endpoints sont resolus dans le job via AWS CLI.
     env:
-      ALB_DNS:  ${{ needs.terraform.outputs.alb_dns }}
-      ASG_NAME: ${{ needs.terraform.outputs.asg_name }}
-      RDS_HOST: ${{ needs.terraform.outputs.rds_host }}
       DB_NAME:  ecommerce_dev
       DB_USER:  ecommerceadmin
+      APP_NAME: ecommerce
+      ENV_NAME: dev
 
     steps:
       - name: Checkout code
@@ -187,6 +186,31 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ── 0. Résoudre les endpoints via AWS CLI (évite les outputs masqués) ──
+      - name: Resolve infrastructure endpoints (AWS CLI)
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names "${APP_NAME}-${ENV_NAME}-backend-alb" \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "")
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          echo "[OK] ALB DNS: $ALB_DNS"
+
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, '${APP_NAME}-${ENV_NAME}-backend-asg')].AutoScalingGroupName" \
+            --output text 2>/dev/null | awk '{print $1}')
+          [ -z "$ASG_NAME" ] && ASG_NAME="${APP_NAME}-${ENV_NAME}-backend-asg"
+          echo "ASG_NAME=$ASG_NAME" >> $GITHUB_ENV
+          echo "[OK] ASG: $ASG_NAME"
+
+          RDS_HOST=$(aws rds describe-db-instances \
+            --db-instance-identifier "${APP_NAME}-${ENV_NAME}-db" \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text 2>/dev/null || echo "")
+          echo "::add-mask::$RDS_HOST"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "[OK] RDS host resolved (masked)"
 
       - name: Wait for backend to be healthy (max 10 min)
         run: |

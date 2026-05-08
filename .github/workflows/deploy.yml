@@ -132,16 +132,13 @@ jobs:
           FRONTEND_IP=$(terraform output -raw frontend_public_ip  2>/dev/null || echo "")
           FRONTEND_DNS=$(terraform output -raw frontend_public_dns 2>/dev/null || echo "")
           ASG_NAME=$(terraform output -raw backend_asg_name  2>/dev/null || echo "")
-          # RDS endpoint format: host:5432 — extract host only, mask in logs
-          RDS_ENDPOINT=$(terraform output -raw rds_endpoint  2>/dev/null || echo "")
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
-          echo "::add-mask::$RDS_HOST"
 
-          echo "alb_dns=$ALB_DNS"        >> $GITHUB_OUTPUT
-          echo "frontend_ip=$FRONTEND_IP" >> $GITHUB_OUTPUT
+          # Outputs — alb_dns AVANT tout masquage
+          echo "alb_dns=$ALB_DNS"          >> $GITHUB_OUTPUT
+          echo "frontend_ip=$FRONTEND_IP"  >> $GITHUB_OUTPUT
           echo "frontend_dns=$FRONTEND_DNS" >> $GITHUB_OUTPUT
-          echo "asg_name=$ASG_NAME"      >> $GITHUB_OUTPUT
-          echo "rds_host=$RDS_HOST"      >> $GITHUB_OUTPUT
+          echo "asg_name=$ASG_NAME"        >> $GITHUB_OUTPUT
+          # rds_host non expose en output (sensible) — resolu dans le job seed via AWS CLI
 
           echo ""
           echo "=============================================="
@@ -168,12 +165,13 @@ jobs:
     name: Database Seed (one-time, idempotent)
     runs-on: ubuntu-latest
     needs: terraform
+    # Pas d'env globaux issus de job outputs (risque de masquage).
+    # Tous les endpoints sont resolus dans le job via AWS CLI.
     env:
-      ALB_DNS:  ${{ needs.terraform.outputs.alb_dns }}
-      ASG_NAME: ${{ needs.terraform.outputs.asg_name }}
-      RDS_HOST: ${{ needs.terraform.outputs.rds_host }}
-      DB_NAME:  ecommerce_dev
-      DB_USER:  ecommerceadmin
+      DB_NAME: ecommerce_dev
+      DB_USER: ecommerceadmin
+      APP_NAME: ecommerce
+      ENV_NAME: dev
 
     steps:
       - name: Checkout code
@@ -186,6 +184,38 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ── 0. Résoudre les endpoints directement via AWS CLI ────────────────
+      # Fix: ne pas dépendre des job outputs (risque de masquage par ::add-mask::)
+      # ALB DNS et RDS host sont obtenus fresh depuis l'API AWS
+      - name: Resolve infrastructure endpoints (AWS CLI)
+        run: |
+          # ALB DNS — non sensible
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names "${APP_NAME}-${ENV_NAME}-backend-alb" \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "")
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          echo "[OK] ALB DNS: $ALB_DNS"
+
+          # ASG name
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=*" \
+            --query "AutoScalingGroups[?contains(AutoScalingGroupName, '${APP_NAME}-${ENV_NAME}-backend-asg')].AutoScalingGroupName" \
+            --output text 2>/dev/null | awk '{print $1}')
+          # Fallback: construire le nom directement
+          [ -z "$ASG_NAME" ] && ASG_NAME="${APP_NAME}-${ENV_NAME}-backend-asg"
+          echo "ASG_NAME=$ASG_NAME" >> $GITHUB_ENV
+          echo "[OK] ASG: $ASG_NAME"
+
+          # RDS host — sensible, masque immediatement
+          RDS_HOST=$(aws rds describe-db-instances \
+            --db-instance-identifier "${APP_NAME}-${ENV_NAME}-db" \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text 2>/dev/null || echo "")
+          echo "::add-mask::$RDS_HOST"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "[OK] RDS host resolved (value masked in logs)"
 
       # ── 1. Attendre que le backend soit healthy ──────────────────────────
       - name: Wait for backend to be healthy (max 10 min)
@@ -228,10 +258,10 @@ jobs:
           INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
-            --output text | awk '{print $1}')
+            --output text 2>/dev/null | awk '{print $1}')
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "[ERROR] No InService instance found in ASG $ASG_NAME"
+            echo "[ERROR] No InService instance in $ASG_NAME"
             exit 1
           fi
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
@@ -250,12 +280,13 @@ jobs:
       - name: Start SSM port-forwarding tunnel to RDS
         if: steps.check-seed.outputs.already_seeded == 'false'
         run: |
+          # RDS_HOST est dans $GITHUB_ENV (masque) — safe pour le tunnel
           aws ssm start-session \
             --target "${{ steps.get-instance.outputs.instance_id }}" \
             --document-name AWS-StartPortForwardingSessionToRemoteHost \
             --parameters "{\"host\":[\"$RDS_HOST\"],\"portNumber\":[\"5432\"],\"localPortNumber\":[\"5432\"]}" &
           echo "SSM_TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "[INFO] SSM tunnel starting (PID: $!), waiting 8s..."
+          echo "[INFO] SSM tunnel starting, waiting 8s..."
           sleep 8
 
       # ── 6. Setup Node.js + dépendances ───────────────────────────────────
