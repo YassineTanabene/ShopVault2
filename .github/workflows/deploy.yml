@@ -307,6 +307,11 @@ jobs:
         run: npx prisma generate --schema=src/prisma/schema.prisma
 
       # ── 7. Exécuter le seed via le tunnel SSM ────────────────────────────
+      # Fix module resolution : seed.ts importe @prisma/client et bcrypt qui
+      # sont dans backend/node_modules. Node.js résout les modules depuis le
+      # répertoire du FICHIER (scripts/), pas depuis le CWD.
+      # Solution : copier seed.ts dans backend/scripts/ puis l'exécuter depuis backend/.
+      # --transpile-only : ignore les erreurs TS7006 (implicit any) sans modifier seed.ts.
       - name: Run database seed
         if: steps.check-seed.outputs.already_seeded == 'false'
         working-directory: backend
@@ -314,9 +319,16 @@ jobs:
           # DATABASE_URL pointe vers localhost:5432 (tunnel SSM → RDS)
           DATABASE_URL: "postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@localhost:5432/${{ env.DB_NAME }}"
         run: |
+          echo "[INFO] Copying seed.ts into backend/scripts/ for module resolution..."
+          mkdir -p scripts
+          cp ../scripts/seed.ts scripts/seed.ts
+
           echo "[INFO] Running seed via SSM tunnel..."
-          npx ts-node --project tsconfig.json ../scripts/seed.ts
+          npx ts-node --project tsconfig.json --transpile-only scripts/seed.ts
+
+          rm -f scripts/seed.ts
           echo "[OK] Seed completed successfully"
+
 
       # ── 8. Fermer le tunnel SSM ───────────────────────────────────────────
       - name: Stop SSM tunnel
